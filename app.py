@@ -1,23 +1,25 @@
+import os
+
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
 import streamlit as st
 import torch
 import torch.nn as nn
-import numpy as np
-import cv2
 from PIL import Image
-from torchvision import transforms, models
 from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
-import matplotlib.pyplot as plt
+from torchvision import models, transforms
 
-# Page config 
+# Page config
 st.set_page_config(
     page_title="Skin Disease Detection",
     page_icon="🔬",
     layout="wide",
 )
 
-# Constants 
+# Constants
 IMG_SIZE    = 448
 MEAN        = [0.485, 0.456, 0.406]
 STD         = [0.229, 0.224, 0.225]
@@ -31,33 +33,32 @@ CLASS_FULL  = {
     'vasc':  'Vascular Lesion',
     'df':    'Dermatofibroma',
 }
-CLASS_RISK = {
-    'mel':   '🔴 High Risk — Malignant',
-    'nv':    '🟢 Low Risk — Benign',
-    'bkl':   '🟢 Low Risk — Benign',
-    'bcc':   '🔴 High Risk — Malignant',
-    'akiec': '🟡 Moderate Risk — Pre-malignant',
-    'vasc':  '🟡 Moderate Risk',
-    'df':    '🟢 Low Risk — Benign',
+# Kind of lesion each class represents (text, colour used to display it)
+CLASS_TYPE = {
+    'mel':   ('Malignant', 'red'),
+    'bcc':   ('Malignant', 'red'),
+    'akiec': ('Precancerous or early (in situ) cancer', 'orange'),
+    'nv':    ('Benign', 'green'),
+    'bkl':   ('Benign', 'green'),
+    'vasc':  ('Benign', 'green'),
+    'df':    ('Benign', 'green'),
 }
-ABCDE_NOTES = {
-    'mel':   'Activations on dark pigmented body and irregular border — aligns with A (asymmetry) and C (colour variation).',
-    'nv':    'Diffuse activations across the lesion — consistent with symmetric, uniformly pigmented mole.',
-    'bkl':   'Activations on rough surface texture — aligns with D (differential structures, milia-like cysts).',
-    'bcc':   'Focal activations on internal structures — aligns with B (irregular border) and D (arborising vessels).',
-    'akiec': 'Activations on scaly surface patches — aligns with D (keratotic scaling) and B (poorly defined border).',
-    'vasc':  'Concentrated activation on vascular structure — aligns with D (red lacunae and vascular structures).',
-    'df':    'Activations on lesion border and peripheral region — aligns with B (border) and A (asymmetry).',
-}
+# Share of test images of each class that the model classified correctly (HAM10000 test split, 1,516 images)
+TEST_SENSITIVITY = {'mel': 0.57, 'nv': 0.92, 'bkl': 0.55, 'bcc': 0.69, 'akiec': 0.75, 'vasc': 0.94, 'df': 0.70}
 
-# CLIP uses two prompts: dermoscopic lesion vs not a lesion
+# CLIP compares two prompts: a dermoscopic lesion against an ordinary photo
 CLIP_POSITIVE = "a close-up dermoscopic image of a skin lesion or mole"
 CLIP_NEGATIVE = "a regular photo of normal skin, a mosquito bite, an insect sting, a bruise, or a non-lesion"
 
-MODEL_PATH = 'hybrid_best.pth'
+APP_DIR      = os.path.dirname(os.path.abspath(__file__))
+MODEL_FILE   = 'hybrid_v2_best.pth'
+MODEL_PATH   = os.path.join(APP_DIR, MODEL_FILE)
+# HAM10000 images are 600 x 450. The hair removal settings are tuned for that scale,
+# so every upload is brought to it first, exactly as the training images were.
+SOURCE_SIZE  = (600, 450)   # (width, height)
 
 
-#  Model definition 
+# Model definition (must match the training notebook)
 class LightweightHybridModel(nn.Module):
     def __init__(self, num_classes=7, embed_dim=384, num_heads=4,
                  num_transformer_layers=4, dropout=0.1, img_size=448):
@@ -94,7 +95,7 @@ class LightweightHybridModel(nn.Module):
         return self.head(tokens[:, 0])
 
 
-# Load hybrid model 
+# Load hybrid model
 @st.cache_resource
 def load_model():
     model = LightweightHybridModel(num_classes=7, embed_dim=384, img_size=IMG_SIZE, dropout=0.3)
@@ -104,17 +105,17 @@ def load_model():
     return model
 
 
-# Load CLIP model 
+# Load CLIP model
 @st.cache_resource
 def load_clip():
-    from transformers import CLIPProcessor, CLIPModel
+    from transformers import CLIPModel, CLIPProcessor
     clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
     clip_proc  = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
     clip_model.eval()
     return clip_model, clip_proc
 
 
-# Transforms 
+# Transforms (the same as the validation transform used in training)
 preprocess = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
@@ -126,20 +127,47 @@ unnorm = transforms.Normalize(
 )
 
 
-# Hair removal 
-def remove_hair(img_rgb: np.ndarray) -> np.ndarray:
-    img_bgr  = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-    gray     = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    kernel   = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 17))
+# Hair removal (the conservative version used to train the model)
+def hair_mask(img_bgr: np.ndarray, kernel_size: int = 11, threshold: int = 22, min_length: int = 35) -> np.ndarray:
+    """Mask of hair pixels: dark, thin structures that are long, and thin or sparse inside their bounding box."""
+    gray     = cv2.GaussianBlur(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY), (3, 3), 0)
+    kernel   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
-    _, mask  = cv2.threshold(blackhat, 10, 255, cv2.THRESH_BINARY)
-    cleaned  = cv2.inpaint(img_bgr, mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
-    return cv2.cvtColor(cleaned, cv2.COLOR_BGR2RGB)
+    cand     = (blackhat > threshold).astype(np.uint8)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(cand, connectivity=8)
+    w, h, area = stats[:, cv2.CC_STAT_WIDTH], stats[:, cv2.CC_STAT_HEIGHT], stats[:, cv2.CC_STAT_AREA]
+    length = np.maximum(w, h)
+    fill   = area / np.maximum(w * h, 1)
+    aspect = length / np.maximum(np.minimum(w, h), 1)
+    keep   = (length >= min_length) & ((fill < 0.35) | (aspect >= 4))
+    keep[0] = False                                   # label 0 is the background
+    mask = (keep[labels] * 255).astype(np.uint8)
+    return cv2.dilate(mask, np.ones((3, 3), np.uint8))
 
 
-# CLIP: check if image is a skin lesion 
+def remove_hair(img_rgb: np.ndarray):
+    """Returns the cleaned image (at the HAM10000 scale) and the share of pixels that were repainted."""
+    if (img_rgb.shape[1], img_rgb.shape[0]) != SOURCE_SIZE:
+        shrinking = img_rgb.shape[1] > SOURCE_SIZE[0]
+        img_rgb = cv2.resize(img_rgb, SOURCE_SIZE, interpolation=cv2.INTER_AREA if shrinking else cv2.INTER_LINEAR)
+    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+    mask    = hair_mask(img_bgr)
+    if not mask.any():
+        return img_rgb, 0.0
+    cleaned = cv2.inpaint(img_bgr, mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+    return cv2.cvtColor(cleaned, cv2.COLOR_BGR2RGB), float((mask > 0).mean())
+
+
+def as_saved_jpeg(img_rgb: np.ndarray) -> np.ndarray:
+    """The training images were saved as JPEG files after hair removal and read back from disk.
+    The model's predictions shift measurably without that step, so the app repeats it."""
+    ok, enc = cv2.imencode('.jpg', cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
+    return cv2.cvtColor(cv2.imdecode(enc, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+
+
+# CLIP: basic check that the upload looks like a skin lesion image
 def is_skin_lesion(clip_model, clip_proc, pil_img: Image.Image):
-    """Returns (is_lesion: bool, lesion_confidence: float)"""
+    """Returns (is_lesion: bool, lesion_score: float)"""
     inputs = clip_proc(
         text=[CLIP_POSITIVE, CLIP_NEGATIVE],
         images=pil_img,
@@ -152,11 +180,12 @@ def is_skin_lesion(clip_model, clip_proc, pil_img: Image.Image):
     return bool(probs[0] > probs[1]), float(probs[0])
 
 
-# Hybrid model inference + Grad-CAM 
+# Hybrid model inference + Grad-CAM
 def predict(model, img_rgb: np.ndarray):
-    cleaned   = remove_hair(img_rgb)
-    pil_img   = Image.fromarray(cleaned)
-    tensor    = preprocess(pil_img).unsqueeze(0)
+    cleaned, hair_share = remove_hair(img_rgb)
+    cleaned = as_saved_jpeg(cleaned)
+    pil_img = Image.fromarray(cleaned)
+    tensor  = preprocess(pil_img).unsqueeze(0)
 
     with torch.no_grad():
         logits = model(tensor)
@@ -166,22 +195,48 @@ def predict(model, img_rgb: np.ndarray):
     pred_name = CLASS_NAMES[pred_idx]
 
     cam = GradCAM(model=model, target_layers=[model.cnn_backbone[-1]])
-    grayscale_cam = cam(input_tensor=tensor,
-                        targets=[ClassifierOutputTarget(pred_idx)])[0]
-    rgb_norm  = np.clip(unnorm(preprocess(pil_img)).permute(1, 2, 0).numpy(), 0, 1)
-    overlay   = show_cam_on_image(rgb_norm, grayscale_cam, use_rgb=True)
+    try:
+        grayscale_cam = cam(input_tensor=tensor,
+                            targets=[ClassifierOutputTarget(pred_idx)])[0]
+    finally:
+        cam.activations_and_grads.release()   # the model is cached, so the hooks must not pile up between uploads
+    rgb_norm = np.clip(unnorm(preprocess(pil_img)).permute(1, 2, 0).numpy(), 0, 1)
+    overlay  = show_cam_on_image(rgb_norm, grayscale_cam, use_rgb=True)
+    overlay  = cv2.resize(overlay, (cleaned.shape[1], cleaned.shape[0]))   # show it at the same shape as the image beside it
 
-    return pred_name, probs, cleaned, overlay
+    return pred_name, probs, cleaned, hair_share, overlay
+
 
 # UI
 st.title("Automated Skin Disease Detection")
 st.markdown("**Author:** Tashmika Pillay | **Supervisor:** Prof Serestina Viriri | University of KwaZulu-Natal")
 
 st.warning(
-    "⚠️ **Research Prototype Disclaimer:** This system is not validated for clinical use. "
+    "**Research prototype.** This system is not validated for clinical use. "
     "All clinical decisions must be made by a qualified medical professional. "
     "This tool is intended for research and educational purposes only."
 )
+
+with st.expander("About this model and how reliable it is"):
+    st.markdown(
+        "The classifier is a hybrid of a MobileNetV3-Small network and a four layer Transformer encoder "
+        "(8.3 million parameters), trained on the HAM10000 dermoscopic dataset at 448 x 448 pixels.\n\n"
+        "**Results on 1,516 held out test images** (lesions never seen in training):\n\n"
+        "| Accuracy | Balanced accuracy | Macro F1 | Macro AUROC |\n"
+        "|---|---|---|---|\n"
+        "| 0.821 | 0.729 | 0.699 | 0.946 |\n\n"
+        "Always answering *nevus* would score an accuracy of 0.672 on the same images.\n\n"
+        "**Share of each class the model identified correctly:** "
+        + ", ".join(f"{CLASS_FULL[c]} {TEST_SENSITIVITY[c]:.0%}" for c in CLASS_NAMES) + ".\n\n"
+        "**Important limits**\n"
+        "- The model missed 43% of the melanomas in the test set, and most of those were labelled as nevus. "
+        "A benign result does not rule out melanoma.\n"
+        "- HAM10000 consists mainly of images of lighter skin. Performance on other skin tones is unknown "
+        "and likely to be lower.\n"
+        "- The model expects dermoscopic images. It was not trained on ordinary phone photographs.\n"
+        "- The input check that runs before classification accepted 98% of real lesion images in testing, "
+        "but rejected only about half of unrelated photographs."
+    )
 
 st.markdown("---")
 
@@ -189,7 +244,7 @@ st.markdown("---")
 try:
     model = load_model()
 except FileNotFoundError:
-    st.error(f"Model file `{MODEL_PATH}` not found. Place `hybrid_best.pth` in the same folder as `app.py`.")
+    st.error(f"Model file `{MODEL_FILE}` not found. Place it in the same folder as `app.py`.")
     st.stop()
 
 clip_available = True
@@ -204,84 +259,104 @@ if uploaded:
     img_pil = Image.open(uploaded).convert("RGB")
     img_rgb = np.array(img_pil)
 
-    # Step 1: CLIP OOD check 
+    # Step 1: input check with CLIP
     if clip_available:
-        with st.spinner("Checking image validity with CLIP..."):
-            lesion, lesion_conf = is_skin_lesion(clip_model, clip_proc, img_pil)
+        with st.spinner("Checking the image..."):
+            lesion, lesion_score = is_skin_lesion(clip_model, clip_proc, img_pil)
 
         if not lesion:
-            col1, _ = st.columns([1, 2])
-            with col1:
-                st.subheader("Uploaded Image")
-                st.image(img_rgb, use_container_width=True)
             st.error(
-                f"**Image not recognised as a skin lesion** (CLIP confidence: {lesion_conf*100:.1f}% lesion). "
-                "This image does not appear to be a dermoscopic skin lesion image. "
-                "It may be a mosquito bite, bruise, rash, or regular photo. "
-                "Please upload a proper dermoscopic image for accurate classification."
+                "**This image did not pass the input check.** It does not look like a dermoscopic image "
+                "of a skin lesion. The classifier was trained only on dermoscopic images, so its answer "
+                "for any other kind of picture would not be meaningful."
             )
-            st.info(
-                "**Why does this happen?** This hybrid model was trained only on dermoscopic images "
-                "from the HAM10000 dataset. CLIP (zero-shot vision-language model) is used as a "
-                "pre-screening step to detect and reject images outside this distribution."
-            )
-            st.stop()
+            st.caption("The check is not perfect. In testing it wrongly turned away about 2% of real lesion images.")
+            if not st.checkbox("This is a dermoscopic image. Classify it anyway."):
+                col1, _ = st.columns([1, 2])
+                with col1:
+                    st.subheader("Uploaded Image")
+                    st.image(img_rgb, width="stretch")
+                st.stop()
 
-    # Step 2: Hybrid model inference
+    # Step 2: hybrid model inference
     col1, col2, col3 = st.columns(3)
     with col1:
         st.subheader("Original Image")
-        st.image(img_rgb, use_container_width=True)
+        st.image(img_rgb, width="stretch")
 
     with st.spinner("Analysing image..."):
-        pred_name, probs, cleaned, overlay = predict(model, img_rgb)
+        pred_name, probs, cleaned, hair_share, overlay = predict(model, img_rgb)
 
     with col2:
-        st.subheader("Hair Removed")
-        st.image(cleaned, use_container_width=True)
+        st.subheader("After Hair Removal")
+        st.image(cleaned, width="stretch")
+        if hair_share == 0:
+            st.caption("No hair was detected, so the image was left unchanged.")
+        else:
+            st.caption(f"Hair was detected and {hair_share:.1%} of the image was repainted.")
 
     with col3:
         st.subheader("Grad-CAM Explanation")
-        st.image(overlay, use_container_width=True)
+        st.image(overlay, width="stretch")
+        st.caption("Warmer colours mark the regions that most raised the score of the predicted class.")
 
-    if clip_available:
-        st.caption(f"✅ CLIP pre-screen passed — image recognised as a dermoscopic skin lesion ({lesion_conf*100:.1f}% confidence).")
+    if clip_available and lesion:
+        st.caption(
+            "Input check passed. This check rejected only about half of unrelated photographs in testing, "
+            "so a pass does not confirm that the image is a dermoscopic lesion."
+        )
+    elif not clip_available:
+        st.caption("The input check is unavailable, so the image was classified without it.")
 
     st.markdown("---")
 
     pred_full = CLASS_FULL[pred_name]
-    risk      = CLASS_RISK[pred_name]
+    type_text, type_colour = CLASS_TYPE[pred_name]
     conf      = float(probs[CLASS_NAMES.index(pred_name)]) * 100
 
     st.subheader("Prediction")
     res_col1, res_col2 = st.columns(2)
 
     with res_col1:
-        st.metric("Predicted Diagnosis", pred_full)
-        st.metric("Confidence", f"{conf:.1f}%")
-        st.markdown(f"**Risk Level:** {risk}")
+        st.metric("Predicted class", pred_full)
+        st.metric("Model probability", f"{conf:.1f}%")
+        st.markdown(f"**Type of lesion:** :{type_colour}[{type_text}]")
+        st.caption(
+            f"On the test set the model correctly identified {TEST_SENSITIVITY[pred_name]:.0%} "
+            f"of the images that truly were {pred_full.lower()}."
+        )
+        if CLASS_TYPE[pred_name][0] == 'Benign':
+            st.info(
+                "A benign prediction does not rule out melanoma. "
+                "In testing, 43 of 145 melanomas were predicted as nevus."
+            )
 
     with res_col2:
-        st.subheader("Confidence Scores")
+        st.subheader("Probability of Each Class")
         fig, ax = plt.subplots(figsize=(5, 3))
         colors  = ['#d62728' if n == pred_name else '#1f77b4' for n in CLASS_NAMES]
         ax.barh([CLASS_FULL[n] for n in CLASS_NAMES],
                 [probs[i] * 100 for i in range(len(CLASS_NAMES))],
                 color=colors)
-        ax.set_xlabel("Confidence (%)")
+        ax.set_xlabel("Probability (%)")
         ax.set_xlim(0, 100)
         plt.tight_layout()
         st.pyplot(fig)
         plt.close()
 
     st.markdown("---")
-    st.subheader("Clinical Explanation (ABCDE Alignment)")
-    st.info(f"**{pred_full}:** {ABCDE_NOTES[pred_name]}")
-    st.markdown("""
-    The Grad-CAM heatmap highlights the image regions the model focused on when making this prediction.
-    Warmer colours (red/yellow) indicate higher attention. These regions are assessed against the
-    **ABCDE rule** used by dermatologists: Asymmetry, Border, Colour, Diameter, Evolution.
-    """)
+    st.subheader("How to Read the Explanation")
+    st.markdown(
+        "The Grad-CAM heatmap shows which parts of the image most increased the model's score for the "
+        "predicted class. It describes what this model responded to. It is not a clinical finding.\n\n"
+        "- In testing, the highlighted regions were enough to restore the model's prediction more "
+        "efficiently than a plain blob over the image centre, so the maps carry real information "
+        "about the model.\n"
+        "- Removing the highlighted regions did not lower the prediction faster than removing the "
+        "centre, so the maps do not prove that those regions are the ones the model needs.\n"
+        "- The explanations have not been reviewed by dermatologists, and they do not show that the model "
+        "uses the features a clinician would use."
+    )
 
     st.markdown("---")
     st.caption("Lightweight Hybrid CNN-Transformer Model | HAM10000 Dataset | UKZN Honours Project 2026")
